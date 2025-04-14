@@ -1,0 +1,81 @@
+services:
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-storage:/var/lib/grafana
+    depends_on:
+      - tempo
+      - loki
+    networks:
+      - monitor-net
+
+  tempo:
+    image: grafana/tempo:latest
+    command: ["-config.file=/etc/tempo.yaml"]
+    ports:
+      - "3200:3200"
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml
+    networks:
+      - monitor-net
+
+  loki:
+    image: grafana/loki:latest
+    user: root
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - monitor-net
+
+  promtail:
+    image: grafana/promtail:latest
+    volumes:
+      - ./logs:/var/log
+      - ./promtail-config.yaml:/etc/promtail/config.yaml
+    command: -config.file=/etc/promtail/config.yaml
+    networks:
+      - monitor-net
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest-amd64
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    depends_on:
+      - tempo
+    networks:
+      - monitor-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    ports:
+      - "9090:9090"
+    networks:
+      - monitor-net
+
+  app:
+    build: ./app
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./logs:/var/log
+    depends_on:
+      - otel-collector
+    networks:
+      - monitor-net
+
+networks:
+  monitor-net:
+
+volumes:
+  grafana-storage:

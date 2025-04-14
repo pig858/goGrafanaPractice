@@ -1,0 +1,26 @@
+
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:                          # 綁到所有介面
+          endpoint: 0.0.0.0:4317
+        http: {}                       # 若要 HTTP 也保留
+
+
+ingester:
+  trace_idle_period: 10s
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 1h
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /tmp/tempo
