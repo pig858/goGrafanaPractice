@@ -9,20 +9,26 @@ clients:
   - url: http://loki:3100/loki/api/v1/push
 
 scrape_configs:
-  - job_name: app
-    static_configs:
-      - targets:
-          - localhost
-        labels:
-          job: app
-          service_name: demo-app
-          __path__: /var/log/app.log
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 10s
+
+    # 只抓 compose 服務名為 app 的容器
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        regex: app
+        action: keep
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: service_name   # 升成 label，Trace→Log 需要
 
     pipeline_stages:
-      - json:
+      - docker: {}                  # 解析外層 Docker JSON
+      - json:                       # 解析 slog JSON
           expressions:
             trace_id: trace_id
+            service_name: service_name
       - labels:
-          trace_id:
-
+          trace_id: trace_id
+          service_name: service_name
 

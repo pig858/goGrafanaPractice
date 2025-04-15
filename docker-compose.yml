@@ -36,7 +36,7 @@ services:
   promtail:
     image: grafana/promtail:latest
     volumes:
-      - ./logs:/var/log
+      - /var/run/docker.sock:/var/run/docker.sock   # ⬅️ 新增
       - ./promtail-config.yaml:/etc/promtail/config.yaml
     command: -config.file=/etc/promtail/config.yaml
     networks:
@@ -67,8 +67,6 @@ services:
     build: ./app
     ports:
       - "8080:8080"
-    volumes:
-      - ./logs:/var/log
     depends_on:
       - otel-collector
     networks:

@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel"
@@ -16,30 +18,55 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
-
-	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/trace"
 )
 
-type ctxKeyLogger struct{}
+/* ---------- (1) 自訂 slog.Handler：自動注入 service_name + trace_id ---------- */
+
+type svcHandler struct {
+	slog.Handler
+	svc string
+}
+
+func (h svcHandler) Handle(ctx context.Context, r slog.Record) error {
+	r.AddAttrs(slog.String("service_name", h.svc))
+	if span := trace.SpanFromContext(ctx); span != nil {
+		if sc := span.SpanContext(); sc.IsValid() {
+			r.AddAttrs(slog.String("trace_id", sc.TraceID().String()))
+		}
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+func newLogger() *slog.Logger {
+	h := svcHandler{
+		Handler: slog.NewJSONHandler(os.Stdout, nil),
+		svc:     "demo-app",
+	}
+	return slog.New(h)
+}
+
+/* ------------------------- (2) Prometheus metrics ---------------------------- */
 
 var (
 	requestCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "app_http_requests_total",
-			Help: "總請求數",
+			Help: "HTTP 請求總數",
 		},
 		[]string{"method", "path"},
 	)
-
 	requestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "app_http_request_duration_seconds",
-			Help:    "每個 API 的請求延遲時間",
+			Help:    "HTTP 請求延遲",
 			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"method", "path"},
 	)
 )
+
+/* -------------------- (3) OpenTelemetry TracerProvider ----------------------- */
 
 func initTracer() {
 	ctx := context.Background()
@@ -60,25 +87,53 @@ func initTracer() {
 	otel.SetTracerProvider(tp)
 }
 
-func traceAndLogMiddleware() gin.HandlerFunc {
+/* ------------------------ (4) Gin middlewares -------------------------------- */
+
+type ctxKeyLogger struct{}
+
+func traceAndLogMiddleware(logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ctx, span := otel.Tracer("demo-app").Start(c, "incoming request")
+		ctx, span := otel.Tracer("demo-app").Start(c.Request.Context(), "incoming request")
 		defer span.End()
 
-		traceID := span.SpanContext().TraceID().String()
-		logger := slog.Default().With("trace_id", traceID)
 		ctx = context.WithValue(ctx, ctxKeyLogger{}, logger)
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
 	}
 }
 
 func metricsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		timer := prometheus.NewTimer(requestDuration.WithLabelValues(c.Request.Method, c.Request.URL.Path))
+		timer := prometheus.NewTimer(
+			requestDuration.WithLabelValues(c.Request.Method, c.FullPath()),
+		)
 		defer timer.ObserveDuration()
-
-		requestCounter.WithLabelValues(c.Request.Method, c.Request.URL.Path).Inc()
+		requestCounter.WithLabelValues(c.Request.Method, c.FullPath()).Inc()
+		c.Next()
 	}
 }
+
+/* ---------- (★ 新增) access‑log middleware：每請求寫一筆 slog --------------- */
+
+func requestLogger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+
+		ctx := c.Request.Context()
+		l := loggerFromContext(ctx)
+
+		l.InfoContext(ctx, "request",
+			"method", c.Request.Method,
+			"path", c.FullPath(),
+			"status", c.Writer.Status(),
+			"latency_ms", time.Since(start).Milliseconds(),
+			"client_ip", c.ClientIP(),
+		)
+	}
+}
+
+/* ---------------------- (5) Helper 取 logger from ctx ----------------------- */
 
 func loggerFromContext(ctx context.Context) *slog.Logger {
 	if l, ok := ctx.Value(ctxKeyLogger{}).(*slog.Logger); ok {
@@ -86,6 +141,8 @@ func loggerFromContext(ctx context.Context) *slog.Logger {
 	}
 	return slog.Default()
 }
+
+/* --------------------------- (6) Handlers ----------------------------------- */
 
 func hello(c *gin.Context) {
 	time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
@@ -97,7 +154,6 @@ func cpu(c *gin.Context) {
 	for i := 0; i < 1e7; i++ {
 		x += i
 	}
-
 	c.String(http.StatusOK, fmt.Sprintf("CPU done: %d\n", x))
 }
 
@@ -105,27 +161,28 @@ func metrics(c *gin.Context) {
 	promhttp.Handler().ServeHTTP(c.Writer, c.Request)
 }
 
-func handler(w http.ResponseWriter, r *http.Request) {
-	logger := loggerFromContext(r.Context())
-	logger.Info("handling request")
-	time.Sleep(200 * time.Millisecond)
-	fmt.Fprintln(w, "Hello trace + log!")
-}
+/* ------------------------------ (7) main ------------------------------------ */
 
 func main() {
-	prometheus.MustRegister(requestCounter)
-	prometheus.MustRegister(requestDuration)
+	prometheus.MustRegister(requestCounter, requestDuration)
 	initTracer()
-	f, _ := os.OpenFile("/var/log/app.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	logger := slog.New(slog.NewJSONHandler(f, nil))
+
+	logger := newLogger()
 	slog.SetDefault(logger)
 
-	r := gin.Default()
-	r.Use(traceAndLogMiddleware(), metricsMiddleware())
+	gin.SetMode(gin.ReleaseMode)
+	gin.DefaultWriter = io.Discard // 關掉內建 access‑log
+
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(traceAndLogMiddleware(logger), metricsMiddleware(), requestLogger())
+
 	r.GET("/metrics", metrics)
 	r.GET("/hello", hello)
 	r.GET("/cpu", cpu)
 
-	slog.Info("Starting server on :8080")
-	r.Run(":8080")
+	logger.Info("starting server", "port", 8080)
+	if err := r.Run(":8080"); err != nil {
+		logger.Error("server stopped", "err", err)
+	}
 }
