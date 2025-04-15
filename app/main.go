@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -94,6 +95,7 @@ type ctxKeyLogger struct{}
 func traceAndLogMiddleware(logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx, span := otel.Tracer("demo-app").Start(c.Request.Context(), "incoming request")
+		span.SetAttributes(attribute.String("service_name", "demo-app"))
 		defer span.End()
 
 		ctx = context.WithValue(ctx, ctxKeyLogger{}, logger)
